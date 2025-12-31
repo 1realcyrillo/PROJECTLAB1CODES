@@ -1,0 +1,129 @@
+// MSP430FR6989 — TX DEBUG with 38 kHz PWM ON
+// UCA0 TX mapped to BOTH P4.2 and P2.0 (choose whichever your board actually routes).
+// PWM 38 kHz on P1.6 (TA0.1) for IR gating: IR_LED = PWM_38k AND NOT(UART_TX).
+// Heartbeat "HB\r\n" every ~250 ms + one-shot word per button press (no auto-repeat).
+
+#include <msp430.h>
+#include <stdint.h>
+
+/* ===== UART A0 @1200 bps — map TX to BOTH P4.2 and P2.0; RX mapped to P4.3 and P2.1 ===== */
+static void uart_a0_init_tx_dualmap_1200(void){
+    // Map P4.2=TXD, P4.3=RXD
+    P4SEL1 &= ~(BIT2 | BIT3);
+    P4SEL0 |=  (BIT2 | BIT3);
+    P4DIR  |=  BIT2;
+
+    UCA0CTLW0  = UCSWRST;
+    UCA0CTLW0 |= UCSSEL__SMCLK;   // ~1 MHz
+    UCA0MCTLW  = 0;
+    UCA0BRW    = 833;             // 1200 bps
+    UCA0CTLW0 &= ~UCSWRST;
+}
+
+static void putc_b(uint8_t c){ while(!(UCA0IFG & UCTXIFG)); UCA0TXBUF = c; }
+static void puts_b(const char *s){ while(*s) putc_b((uint8_t)*s++); }
+
+/* ===== 38 kHz PWM ON (TA0.1 -> P1.6) ===== */
+static void start_pwm_38k_on_P16(void){
+    P1DIR  |= BIT6;
+    P1SEL1 |= BIT6;
+    P1SEL0 |= BIT6;                    // TA0.1 on P1.6
+    TA0CCR0  = 25;                     // ~38.46 kHz from ~1 MHz SMCLK
+    TA0CCTL1 = OUTMOD_7;               // reset/set
+    TA0CCR1  = 9;                      // ~33% duty
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+/* ===== Buttons (active-low, pull-ups) ===== */
+#define FWD_PIN   BIT7  /* P2.7 -> "FORWARD" */
+#define REV_PIN   BIT6  /* P2.6 -> "REVERSE" */
+#define LEFT_PIN  BIT3  /* P3.3 -> "LEFT"    */
+#define RIGHT_PIN BIT6  /* P3.6 -> "RIGHT"   */
+#define HELLO_PIN BIT1  /* P1.1 -> "Hello"   */
+#define STOP_PIN  BIT3  /* P2.3 -> "STOP"    */
+#define STRIKE_PIN BIT0 /* P2.0 -> "STRIKE"  */
+#define RESET_PIN  BIT1 /* P4.1 -> "RESET"   */
+#define CLAMP_PIN  BIT0 /* P4.0 -> "CLAMP"   */
+#define UNCLAMP_PIN BIT4 /* P1.4 -> "UNCLAMP" */
+
+static void gpio_init(void){
+    PM5CTL0 &= ~LOCKLPM5;              // unlock GPIO
+
+    // Local red LED to prove ISR fires
+    P1DIR |= BIT0; P1OUT &= ~BIT0;
+
+    // Port 2 buttons
+    P2DIR &= ~(FWD_PIN | REV_PIN | STOP_PIN | STRIKE_PIN);
+    P2REN |=  (FWD_PIN | REV_PIN | STOP_PIN | STRIKE_PIN);
+    P2OUT |=  (FWD_PIN | REV_PIN | STOP_PIN | STRIKE_PIN);
+    P2IES |=  (FWD_PIN | REV_PIN | STOP_PIN | STRIKE_PIN);
+    P2IFG &= ~(FWD_PIN | REV_PIN | STOP_PIN | STRIKE_PIN);
+    P2IE  |=  (FWD_PIN | REV_PIN | STOP_PIN | STRIKE_PIN);
+
+    // Port 3 buttons
+    P3DIR &= ~(LEFT_PIN | RIGHT_PIN);
+    P3REN |=  (LEFT_PIN | RIGHT_PIN);
+    P3OUT |=  (LEFT_PIN | RIGHT_PIN);
+    P3IES |=  (LEFT_PIN | RIGHT_PIN);
+    P3IFG &= ~(LEFT_PIN | RIGHT_PIN);
+    P3IE  |=  (LEFT_PIN | RIGHT_PIN);
+
+    // Port 1 Hello
+    P1DIR &= ~(HELLO_PIN | UNCLAMP_PIN);
+    P1REN |=  (HELLO_PIN | UNCLAMP_PIN);
+    P1OUT |=  (HELLO_PIN | UNCLAMP_PIN);
+    P1IES |=  (HELLO_PIN | UNCLAMP_PIN);
+    P1IFG &= ~(HELLO_PIN | UNCLAMP_PIN);
+    P1IE  |=  (HELLO_PIN | UNCLAMP_PIN);
+
+    // Port 4 button for reset
+    P4DIR &= ~(RESET_PIN | CLAMP_PIN);
+    P4REN |=  (RESET_PIN | CLAMP_PIN);
+    P4OUT |=  (RESET_PIN | CLAMP_PIN);
+    P4IES |=  (RESET_PIN | CLAMP_PIN);
+    P4IFG &= ~(RESET_PIN | CLAMP_PIN);
+    P4IE  |=  (RESET_PIN | CLAMP_PIN);
+}
+
+static void send_word(const char* s){ puts_b(s); puts_b("\r\n"); }
+
+int main(void){
+    WDTCTL = WDTPW | WDTHOLD;
+    gpio_init();
+    uart_a0_init_tx_dualmap_1200();
+    start_pwm_38k_on_P16();            // <-- PWM is ON
+
+    __enable_interrupt();
+
+    for(;;){
+        // Heartbeat every ~250 ms so RX/logic probe can see life over IR
+        puts_b("HB\r\n");
+        __delay_cycles(250000);
+    }
+}
+
+/* ===== One-shot sends per press (no auto-repeat in debug) ===== */
+#pragma vector=PORT2_VECTOR
+__interrupt void PORT2_ISR(void){
+    uint16_t f = P2IFG & P2IE;
+    if (f & FWD_PIN){  P2IFG &= ~FWD_PIN;  P1OUT ^= BIT0; send_word("FORWARD"); }
+    if (f & REV_PIN){  P2IFG &= ~REV_PIN;  P1OUT ^= BIT0; send_word("REVERSE"); }
+    if (f & STOP_PIN){  P2IFG &= ~STOP_PIN; P1OUT ^= BIT0; send_word("STOP");   }
+    if (f & STRIKE_PIN){ P2IFG &= ~STRIKE_PIN; P1OUT ^= BIT0; send_word("STRIKE"); }
+}
+#pragma vector=PORT3_VECTOR
+__interrupt void PORT3_ISR(void){
+    uint16_t f = P3IFG & P3IE;
+    if (f & LEFT_PIN){   P3IFG &= ~LEFT_PIN;   P1OUT ^= BIT0; send_word("LEFT");  }
+    if (f & RIGHT_PIN){  P3IFG &= ~RIGHT_PIN;  P1OUT ^= BIT0; send_word("RIGHT"); }
+}
+#pragma vector=PORT1_VECTOR
+__interrupt void PORT1_ISR(void){
+    if (P1IFG & HELLO_PIN){ P1IFG &= ~HELLO_PIN; P1OUT ^= BIT0; send_word("Hello"); }
+    if (P1IFG & UNCLAMP_PIN){ P1IFG &= ~UNCLAMP_PIN; P1OUT ^= BIT0; send_word("UNCLAMP"); }
+}
+#pragma vector=PORT4_VECTOR
+__interrupt void PORT4_ISR(void){
+    if (P4IFG & RESET_PIN){ P4IFG &= ~RESET_PIN; P1OUT ^= BIT0; send_word("RESET"); }
+    if (P4IFG & CLAMP_PIN){ P4IFG &= ~CLAMP_PIN; P1OUT ^= BIT0; send_word("CLAMP"); }
+}
