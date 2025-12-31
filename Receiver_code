@@ -1,0 +1,372 @@
+// MSP430FR6989 — RX -> H-Bridge motor control (FORWARD/REVERSE/LEFT/RIGHT)
+// This is my receiver-side code. It listens on UART (P4.3) at 1200 bps.
+// When it sees a text command like "FORWARD\n", it sets the H-bridge pins
+// and lets the software PWM drive both motor enable lines at ~66% duty.
+//
+// My mapping idea:
+//   - ENA = left motor enable (PWM)
+//   - ENB = right motor enable (PWM)
+//   - AIN1/AIN2 = left motor direction
+//   - BIN1/BIN2 = right motor direction
+//
+// Motions I want:
+//   FORWARD: both motors forward, 66%
+//   REVERSE: both motors reverse, 66%
+//   LEFT:    spin/turn by making left go backward, right go forward
+//   RIGHT:   opposite of LEFT
+
+#include <msp430.h>
+#include <stdint.h>
+
+/* ====== my pin map (I can change to match my wiring) ====== */
+// These two pins get toggled by the timer ISR to fake a PWM output.
+#define ENA_PORT_DIR   P4DIR
+#define ENA_PORT_OUT   P4OUT
+#define ENA_BIT        BIT7    // I'm using P4.7 for left enable
+
+#define ENB_PORT_DIR   P3DIR
+#define ENB_PORT_OUT   P3OUT
+#define ENB_BIT        BIT6    // I'm using P3.6 for right enable
+
+// Left motor direction pins
+#define AIN_PORT_DIR   P1DIR
+#define AIN_PORT_OUT   P1OUT
+#define AIN1_BIT       BIT6    // P1.6 = left IN1
+#define AIN2_BIT       BIT5    // P1.5 = left IN2
+
+// Right motor direction pins
+#define BIN_PORT_DIR   P2DIR
+#define BIN_PORT_OUT   P2OUT
+#define BIN1_BIT       BIT2    // P2.2 = right IN1
+#define BIN2_BIT       BIT3    // P2.3 = right IN2
+
+// Servo flipper on P1.4 using Timer1_A
+#define FLIP_SERVO_DIR P1DIR
+#define FLIP_SERVO_OUT P1OUT
+#define FLIP_SERVO_BIT BIT4 // P1.4
+
+// Servo clamp on P3.3 using Timer1_A
+#define CLAMP_SERVO_DIR P3DIR
+#define CLAMP_SERVO_OUT P3OUT
+#define CLAMP_SERVO_BIT BIT3
+
+#define SERVO_MIN_US    500u
+#define SERVO_MAX_US    2400u
+#define SERVO_PERIOD_US 20000u
+
+static volatile uint16_t g_flip_ticks = SERVO_MIN_US;
+static volatile uint16_t g_clamp_ticks = SERVO_MIN_US;
+
+static uint16_t servo_deg_to_ticks(uint16_t deg){
+    if (deg > 180) deg = 180;
+    uint32_t us = SERVO_MIN_US + (uint32_t)(SERVO_MAX_US - SERVO_MIN_US) * deg / 180u;
+    return (uint16_t)us;
+}
+static void flipper_set_deg(uint16_t deg){
+    g_flip_ticks = servo_deg_to_ticks(deg);
+}
+static void clamp_set_deg(uint16_t deg){
+    g_clamp_ticks = servo_deg_to_ticks(deg);
+}
+
+static void servos_init_dual(void){
+
+    FLIP_SERVO_DIR |= FLIP_SERVO_BIT;
+    FLIP_SERVO_OUT &= ~FLIP_SERVO_BIT;
+
+    CLAMP_SERVO_DIR |= CLAMP_SERVO_BIT;
+    CLAMP_SERVO_OUT &= ~CLAMP_SERVO_BIT;
+
+    g_flip_ticks = servo_deg_to_ticks(0);
+    g_clamp_ticks = servo_deg_to_ticks(0);
+
+    TA1CCR0 = SERVO_PERIOD_US - 1;
+    TA1CCTL0 = CCIE;
+    TA1CCTL1 = CCIE;
+    TA1CCTL2 = CCIE;
+    TA1CTL = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+
+/* ====== UART setup: I'm only receiving on A0, P4.3, 1200 bps ====== */
+static void uart_a0_init_rx_1200(void){
+    // hook P4.3 to the UART RX function
+    P4SEL1 &= ~BIT3;
+    P4SEL0 |=  BIT3;
+
+    UCA0CTLW0  = UCSWRST;              // hold USCI in reset so I can set it
+    UCA0CTLW0 |= UCSSEL__SMCLK;        // run it from SMCLK (~1 MHz)
+    UCA0MCTLW  = 0;
+    UCA0BRW    = 833;                  // 1,000,000 / 1200 ≈ 833
+    UCA0CTLW0 &= ~UCSWRST;             // release reset
+    UCA0IFG   &= ~UCRXIFG;             // clear pending
+    UCA0IE    |=  UCRXIE;              // enable RX interrupt so I can parse lines
+}
+
+/* ====== software PWM plan ======
+   I don't want to burn real PWM pins, so I'm letting Timer_A0 interrupt at 1 kHz.
+   - CCR0: start of each PWM cycle -> I force both EN pins HIGH
+   - CCR1: moment to shut off ENA
+   - CCR2: moment to shut off ENB
+   Duty = compare value / period.
+*/
+#define PWM_FREQ_HZ     1000u
+#define SMCLK_HZ        1000000u
+#define PWM_PERIOD_TCK  (SMCLK_HZ / PWM_FREQ_HZ)   // 1000 ticks @ 1 MHz
+#define DUTY_PCT_66     66u                        // target duty
+
+// I keep the current duty (in timer ticks) here so I can change it later if I want
+static volatile uint16_t g_dutyA_ticks = (PWM_PERIOD_TCK * DUTY_PCT_66) / 100;
+static volatile uint16_t g_dutyB_ticks = (PWM_PERIOD_TCK * DUTY_PCT_66) / 100;
+
+static void pwm_init_1kHz(void){
+    // make EN pins outputs and start LOW
+    ENA_PORT_DIR |= ENA_BIT;
+    ENA_PORT_OUT &= ~ENA_BIT;
+    ENB_PORT_DIR |= ENB_BIT;
+    ENB_PORT_OUT &= ~ENB_BIT;
+
+    // set timer period
+    TA0CCR0  = PWM_PERIOD_TCK - 1;
+    TA0CCTL0 = CCIE;       // I want an interrupt every period (frame start)
+    TA0CCTL1 = CCIE;       // interrupt to drop ENA at its duty
+    TA0CCTL2 = CCIE;       // interrupt to drop ENB at its duty
+    TA0CCR1  = g_dutyA_ticks;
+    TA0CCR2  = g_dutyB_ticks;
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR;  // SMCLK, up mode, clear
+}
+
+// helper to force both motors to the same ~66% duty
+static void pwm_set66_both(void){
+    g_dutyA_ticks = (PWM_PERIOD_TCK * DUTY_PCT_66) / 100;
+    g_dutyB_ticks = (PWM_PERIOD_TCK * DUTY_PCT_66) / 100;
+    TA0CCR1 = g_dutyA_ticks;
+    TA0CCR2 = g_dutyB_ticks;
+}
+
+/* ====== H-bridge helpers (these just set direction pins) ====== */
+static void motors_coast(void){
+    // if I ever want to fully coast the motors, I drop enables here
+    ENA_PORT_OUT &= ~ENA_BIT;
+    ENB_PORT_OUT &= ~ENB_BIT;
+}
+
+static void stop_all(void){
+
+    AIN_PORT_OUT &= ~AIN1_BIT;
+    AIN_PORT_OUT &= ~AIN2_BIT;
+    BIN_PORT_OUT &= ~BIN1_BIT;
+    BIN_PORT_OUT &= ~BIN2_BIT;
+}
+
+static void left_forward(void){   // AIN1=1, AIN2=0
+    AIN_PORT_OUT |=  AIN1_BIT;
+    AIN_PORT_OUT &= ~AIN2_BIT;
+}
+static void left_reverse(void){   // AIN1=0, AIN2=1
+    AIN_PORT_OUT &= ~AIN1_BIT;
+    AIN_PORT_OUT |=  AIN2_BIT;
+}
+static void right_forward(void){  // BIN1=1, BIN2=0
+    BIN_PORT_OUT |=  BIN1_BIT;
+    BIN_PORT_OUT &= ~BIN2_BIT;
+}
+static void right_reverse(void){  // BIN1=0, BIN2=1
+    BIN_PORT_OUT &= ~BIN1_BIT;
+    BIN_PORT_OUT |=  BIN2_BIT;
+}
+
+/* ====== motion-level functions (what I actually call on a command) ====== */
+
+static void cmd_STOP(void){
+    stop_all();
+}
+
+static void cmd_FORWARD(void){
+    // both wheels forward, then make sure PWM is at 66%
+    left_forward();
+    right_forward();
+    pwm_set66_both();
+}
+static void cmd_REVERSE(void){
+    left_reverse();
+    right_reverse();
+    pwm_set66_both();
+}
+static void cmd_LEFT(void){
+    // I want it to pivot/turn: left backward, right forward
+    left_reverse();
+    right_forward();
+    pwm_set66_both();
+}
+static void cmd_RIGHT(void){
+    left_forward();
+    right_reverse();
+    pwm_set66_both();
+}
+static void cmd_STRIKE(void){
+    flipper_set_deg(90);
+}
+static void cmd_RESET_FLIP(void){
+    flipper_set_deg(0);
+}
+
+static void cmd_CLAMP(void){
+    clamp_set_deg(90);
+}
+static void cmd_UNCLAMP(void){
+    clamp_set_deg(0);
+}
+
+/* ====== simple newline-based UART command parser ======
+   I'm keeping a tiny buffer. Every character goes in until I see '\n'.
+   Then I compare exact strings: "FORWARD", "REVERSE", "LEFT", "RIGHT".
+*/
+#define LBUF_MAX  16
+static volatile char    lbuf[LBUF_MAX];
+static volatile uint8_t llen = 0;
+
+static void lbuf_reset(void){ llen = 0; }
+static void lbuf_push(uint8_t c){
+    if (llen < (LBUF_MAX-1))
+        lbuf[llen++] = (char)c;
+}
+
+// tiny memcmp for my fixed commands
+static int memeq(const char* a, const char* b, unsigned n){
+    while(n--){
+        if ((unsigned char)*a++ != (unsigned char)*b++)
+            return 0;
+    }
+    return 1;
+}
+
+static void handle_line(void){
+    lbuf[llen] = '\0';   // make it a C string so comparisons work
+
+    // I match length first so I don't accidentally match prefixes
+    if (llen==7 && lbuf[0]=='F' && memeq((const char*)lbuf,"FORWARD",7)) {
+        cmd_FORWARD();
+    } else if (llen==7 && lbuf[0]=='R' && memeq((const char*)lbuf,"REVERSE",7)) {
+        cmd_REVERSE();
+    } else if (llen==4 && lbuf[0]=='L' && memeq((const char*)lbuf,"LEFT",4)) {
+        cmd_LEFT();
+    } else if (llen==5 && lbuf[0]=='R' && memeq((const char*)lbuf,"RIGHT",5)) {
+        cmd_RIGHT();
+    } else if (llen == 4 && lbuf[0]=='S' && memeq((const char*)lbuf,"STOP",4)) {
+        cmd_STOP();
+    } else if (llen == 6 && lbuf[0]=='S' && memeq((const char*)lbuf,"STRIKE",6)) {
+        cmd_STRIKE();
+    } else if (llen == 5 && lbuf[0]=='R' && memeq((const char*)lbuf,"RESET",5)) {
+        cmd_RESET_FLIP();
+    } else if (llen == 5 && lbuf[0]=='C' && memeq((const char*)lbuf,"CLAMP",5)) {
+        cmd_CLAMP();
+    } else if (llen == 7 && lbuf[0]=='U' && memeq((const char*)lbuf,"UNCLAMP",7)) {
+        cmd_UNCLAMP();
+    }
+    // anything else I just ignore
+
+    lbuf_reset();
+}
+
+/* ====== basic GPIO bring-up ====== */
+static void io_init(void){
+    PM5CTL0 &= ~LOCKLPM5;   // turn off high-impedance mode
+
+    // make all direction pins outputs, start LOW
+    AIN_PORT_DIR |= (AIN1_BIT | AIN2_BIT);
+    BIN_PORT_DIR |= (BIN1_BIT | BIN2_BIT);
+    AIN_PORT_OUT &= ~(AIN1_BIT | AIN2_BIT);
+    BIN_PORT_OUT &= ~(BIN1_BIT | BIN2_BIT);
+}
+
+int main(void){
+    WDTCTL = WDTPW | WDTHOLD;  // stop watchdog while I set up
+
+    io_init();
+    pwm_init_1kHz();          // start the fake PWM engine
+    uart_a0_init_rx_1200();   // start UART so I can receive commands
+    servos_init_dual();
+
+    flipper_set_deg(0);
+    clamp_set_deg(0);
+
+
+
+    __enable_interrupt();
+    for(;;){
+        __no_operation();     // I'm just letting ISRs do the work
+    }
+}
+
+/* ====== ISR section ====== */
+// Timer0_A0 -> start of every PWM period: I force both enable pins HIGH
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void TIMER0_A0_ISR(void){
+    ENA_PORT_OUT |= ENA_BIT;
+    ENB_PORT_OUT |= ENB_BIT;
+}
+
+// Timer0_A1 -> compare events (CCR1, CCR2, ...): I drop enables at the right time
+#pragma vector=TIMER0_A1_VECTOR
+__interrupt void TIMER0_A1_ISR(void){
+    switch (TA0IV){
+        case TA0IV_TACCR1:   // time to drop ENA
+            ENA_PORT_OUT &= ~ENA_BIT;
+            break;
+        case TA0IV_TACCR2:   // time to drop ENB
+            ENB_PORT_OUT &= ~ENB_BIT;
+            break;
+        default:
+            break;
+    }
+}
+
+// UART RX ISR: collect bytes until newline, then handle the command
+#pragma vector=USCI_A0_VECTOR
+__interrupt void USCI_A0_ISR(void){
+    if (UCA0IFG & UCRXIFG){
+        uint8_t b = UCA0RXBUF;      // reading this clears the RX flag
+
+        // if UART says the byte was bad, I just dump the current line
+        if (UCA0STATW & UCRXERR){
+            lbuf_reset();
+            return;
+        }
+
+        if (b=='\r')
+            return;                 // ignore CR
+        if (b=='\n'){               // newline ends the command
+            handle_line();
+            return;
+        }
+
+        lbuf_push(b);               // otherwise add byte to buffer
+    }
+}
+
+#pragma vector = TIMER1_A0_VECTOR
+__interrupt void TIMER1_A0_ISR(void){
+    FLIP_SERVO_OUT |= FLIP_SERVO_BIT;
+    CLAMP_SERVO_OUT |= CLAMP_SERVO_BIT;
+
+    TA1CCR1 = g_flip_ticks;
+    TA1CCR2 = g_clamp_ticks;
+}
+
+#pragma vector = TIMER1_A1_VECTOR
+__interrupt void TIMER1_A1_ISR(void){
+    switch (TA1IV)
+    {
+    case TA1IV_TACCR1:
+        FLIP_SERVO_OUT &= ~FLIP_SERVO_BIT;
+        break;
+
+    case TA1IV_TACCR2:
+        CLAMP_SERVO_OUT &= ~CLAMP_SERVO_BIT;
+        break;
+
+    default:
+        break;
+    }
+}
